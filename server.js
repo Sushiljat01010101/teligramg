@@ -4,8 +4,16 @@ const http = require('http');
 const path = require('path');
 const cors = require('cors');
 const { Server } = require('socket.io');
-const { getMedia } = require('./database');
-const request = require('https'); // For manually proxying the telegram file
+const bcrypt = require('bcryptjs');
+const request = require('https'); 
+
+const { 
+  getMedia, deleteMedia, deleteMediaByCaption, 
+  createUser, getUserByUsername, getUserById, updateUserBotConfig 
+} = require('./database');
+const { authenticateToken, generateToken, JWT_SECRET } = require('./auth');
+const jwt = require('jsonwebtoken');
+const TelegramBot = require('node-telegram-bot-api');
 
 const app = express();
 const server = http.createServer(app);
@@ -16,16 +24,97 @@ app.use(cors());
 app.use(express.static(path.join(__dirname, 'public')));
 app.use(express.json());
 
-// Init Telegram Bot
-const { initBot, getFileStreamOrUrl } = require('./bot');
-initBot(io);
+// Init Telegram Bots for all active users
+const { initAllBots, startUserBot, getFileStreamOrUrl } = require('./bot');
+initAllBots(io);
 
-// API endpoint to fetch all media
-app.get('/api/media', async (req, res) => {
+// Socket Middleware for Auth
+io.use((socket, next) => {
+  const token = socket.handshake.auth.token;
+  if (!token) return next(new Error('Authentication error'));
+  
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) return next(new Error('Authentication error'));
+    socket.user = user;
+    next();
+  });
+});
+
+io.on('connection', (socket) => {
+  if (socket.user) {
+    socket.join(`user_${socket.user.id}`);
+  }
+});
+
+// --- AUTH API ---
+app.post('/api/auth/register', async (req, res) => {
+  const { username, password } = req.body;
+  if (!username || !password) return res.status(400).json({ error: 'Missing fields' });
+  
+  const existing = await getUserByUsername(username);
+  if (existing) return res.status(400).json({ error: 'Username taken' });
+
+  const hash = await bcrypt.hash(password, 10);
+  const user = await createUser(username, hash);
+  if (!user) return res.status(500).json({ error: 'Database error' });
+
+  const token = generateToken(user);
+  res.json({ token, user: { id: user.id, username: user.username } });
+});
+
+app.post('/api/auth/login', async (req, res) => {
+  const { username, password } = req.body;
+  const user = await getUserByUsername(username);
+  if (!user) return res.status(400).json({ error: 'Invalid credentials' });
+
+  const valid = await bcrypt.compare(password, user.password);
+  if (!valid) return res.status(400).json({ error: 'Invalid credentials' });
+
+  const token = generateToken(user);
+  res.json({ token, user: { id: user.id, username: user.username } });
+});
+
+// --- PROFILE API ---
+app.get('/api/user/profile', authenticateToken, async (req, res) => {
+  const user = await getUserById(req.user.id);
+  if (!user) return res.status(404).json({ error: 'Not found' });
+  res.json({ telegram_bot_token: user.telegram_bot_token, telegram_chat_id: user.telegram_chat_id });
+});
+
+app.post('/api/user/profile', authenticateToken, async (req, res) => {
+  const { telegram_bot_token, telegram_chat_id } = req.body;
+
+  // 1. Verify token is authentic
+  if (telegram_bot_token) {
+    try {
+      const testBot = new TelegramBot(telegram_bot_token, { polling: false });
+      await testBot.getMe();
+    } catch (err) {
+      return res.status(400).json({ error: 'Invalid Telegram Bot Token. Please check BotFather.' });
+    }
+  }
+
+  try {
+    const user = await updateUserBotConfig(req.user.id, telegram_bot_token, telegram_chat_id);
+    if (!user) return res.status(500).json({ error: 'Database error while saving profile.' });
+
+    // Update dynamic bot
+    startUserBot(user.id, user.telegram_bot_token, user.telegram_chat_id, io);
+    res.json({ success: true });
+  } catch (err) {
+    if (err.message === 'TOKEN_IN_USE') {
+      return res.status(400).json({ error: 'This Bot Token is already registered to another user.' });
+    }
+    return res.status(500).json({ error: 'Unknown Server Error' });
+  }
+});
+
+// --- MEDIA API ---
+app.get('/api/media', authenticateToken, async (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 50;
     const offset = parseInt(req.query.offset) || 0;
-    const items = await getMedia(limit, offset);
+    const items = await getMedia(req.user.id, limit, offset);
     res.json(items);
   } catch (err) {
     console.error(err);
@@ -33,25 +122,19 @@ app.get('/api/media', async (req, res) => {
   }
 });
 
-// Proxy endpoint to prevent URL expiration and CORS issues on canvas/video
-app.get('/api/proxy/:fileId', async (req, res) => {
+// Proxy endpoint
+app.get('/api/proxy/:fileId', authenticateToken, async (req, res) => {
   const fileId = req.params.fileId;
+  const userId = req.user.id;
   if (!fileId) return res.status(400).send('File ID required');
 
   try {
-    const fileUrl = await getFileStreamOrUrl(fileId);
-    if (!fileUrl) return res.status(404).send('File not found in Telegram');
+    const fileUrl = await getFileStreamOrUrl(userId, fileId);
+    if (!fileUrl) return res.status(404).send('File not found/Bot inactive');
 
-    // Proxy the request directly to Telegram servers
     request.get(fileUrl, (externalRes) => {
-      // Pipe the headers
-      if (externalRes.headers['content-type']) {
-        res.setHeader('Content-Type', externalRes.headers['content-type']);
-      }
-      if (externalRes.headers['content-length']) {
-        res.setHeader('Content-Length', externalRes.headers['content-length']);
-      }
-      // Security headers for browser caching (optional, since fileId represents a unique file content)
+      if (externalRes.headers['content-type']) res.setHeader('Content-Type', externalRes.headers['content-type']);
+      if (externalRes.headers['content-length']) res.setHeader('Content-Length', externalRes.headers['content-length']);
       res.setHeader('Cache-Control', 'public, max-age=31536000');
       
       externalRes.pipe(res);
@@ -66,24 +149,22 @@ app.get('/api/proxy/:fileId', async (req, res) => {
   }
 });
 
-// Delete individual media
-app.delete('/api/media/:id', async (req, res) => {
+app.delete('/api/media/:id', authenticateToken, async (req, res) => {
   const id = parseInt(req.params.id);
-  const success = await require('./database').deleteMedia(id);
+  const success = await deleteMedia(req.user.id, id);
   if (success) {
-    io.emit('media_deleted', id);
+    io.to(`user_${req.user.id}`).emit('media_deleted', id);
     res.json({ success: true });
   } else {
     res.status(404).json({ error: 'Not found' });
   }
 });
 
-// Delete category (all media with the same caption)
-app.delete('/api/category/:caption', async (req, res) => {
-  const caption = req.params.caption; // exact caption string
-  const success = await require('./database').deleteMediaByCaption(caption);
+app.delete('/api/category/:caption', authenticateToken, async (req, res) => {
+  const caption = req.params.caption;
+  const success = await deleteMediaByCaption(req.user.id, caption);
   if (success) {
-    io.emit('category_deleted', caption);
+    io.to(`user_${req.user.id}`).emit('category_deleted', caption);
     res.json({ success: true });
   } else {
     res.status(404).json({ error: 'Not found' });
