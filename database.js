@@ -144,12 +144,21 @@ module.exports = {
     }
   },
   
-  getMedia: async (userId, limit = 50, offset = 0) => {
+  getMedia: async (userId, limit = 20, offset = 0, type = 'all', caption = null, search = null) => {
     try {
-      const { data, error } = await supabase
-        .from('media')
-        .select('*')
-        .eq('user_id', userId)
+      let query = supabase.from('media').select('*').eq('user_id', userId);
+
+      if (type && type !== 'all') {
+        query = query.eq('type', type);
+      }
+      if (caption) {
+        query = query.eq('caption', caption);
+      }
+      if (search) {
+        query = query.ilike('caption', `%${search}%`);
+      }
+
+      const { data, error } = await query
         .order('date', { ascending: false })
         .range(offset, offset + limit - 1);
 
@@ -157,6 +166,26 @@ module.exports = {
       return data || [];
     } catch (err) {
       console.error("Supabase getMedia Error:", err);
+      return [];
+    }
+  },
+
+  getCategories: async (userId) => {
+    try {
+      const { data, error } = await supabase
+        .from('media')
+        .select('caption')
+        .eq('user_id', userId)
+        .not('caption', 'is', null)
+        .neq('caption', '')
+        .order('date', { ascending: false })
+        .limit(1000);
+      
+      if (error) throw error;
+      
+      const uniqueHeaders = [...new Set(data.map(m => m.caption))];
+      return uniqueHeaders;
+    } catch(err) {
       return [];
     }
   },

@@ -112,12 +112,25 @@ app.post('/api/user/profile', authenticateToken, async (req, res) => {
 // --- MEDIA API ---
 app.get('/api/media', authenticateToken, async (req, res) => {
   try {
-    const limit = parseInt(req.query.limit) || 50;
+    const limit = parseInt(req.query.limit) || 20;
     const offset = parseInt(req.query.offset) || 0;
-    const items = await getMedia(req.user.id, limit, offset);
+    const type = req.query.type || 'all';
+    const caption = req.query.caption || null;
+    const search = req.query.search || null;
+    
+    const items = await require('./database').getMedia(req.user.id, limit, offset, type, caption, search);
     res.json(items);
   } catch (err) {
     console.error(err);
+    res.json([]);
+  }
+});
+
+app.get('/api/categories', authenticateToken, async (req, res) => {
+  try {
+    const categories = await require('./database').getCategories(req.user.id);
+    res.json(categories);
+  } catch (err) {
     res.json([]);
   }
 });
