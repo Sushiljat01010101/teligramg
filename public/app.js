@@ -36,6 +36,21 @@ document.addEventListener('DOMContentLoaded', () => {
   let allMedia = [];
   let isLogin = true;
 
+  // Infinity Scroll state
+  let currentOffset = 0;
+  const LIMIT = 20;
+  let isFetching = false;
+  let hasMore = true;
+  let searchQuery = '';
+  let searchTimeout = null;
+  let allCategories = [];
+
+  const observer = new IntersectionObserver((entries) => {
+    if (entries[0].isIntersecting && hasMore && !isFetching && localStorage.getItem('token')) {
+      fetchMedia(false); // fetch next page
+    }
+  }, { rootMargin: '300px' });
+
   // Initialize Theme
   const savedTheme = localStorage.getItem('theme') || 'dark';
   html.setAttribute('data-theme', savedTheme);
@@ -112,8 +127,11 @@ document.addEventListener('DOMContentLoaded', () => {
     if (socket) socket.disconnect();
     socket = io({ auth: { token: localStorage.getItem('token') } });
     setupSocketListeners();
+
+    const trigger = document.getElementById('load-more-trigger');
+    if (trigger) observer.observe(trigger);
     
-    fetchMedia();
+    fetchMedia(true);
   }
 
   authSwitchBtn.addEventListener('click', () => {
@@ -195,51 +213,83 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   if (searchInput) {
-    searchInput.addEventListener('input', () => {
-      renderGallery();
+    searchInput.addEventListener('input', (e) => {
+      searchQuery = e.target.value.toLowerCase().trim();
+      clearTimeout(searchTimeout);
+      searchTimeout = setTimeout(() => {
+        fetchMedia(true);
+      }, 500);
     });
   }
 
-  async function fetchMedia() {
+  async function fetchCategories() {
     try {
-      const res = await fetch('/api/media?limit=100', { headers: getHeaders() });
-      if (!res.ok) throw new Error("Failed to fetch");
+      const res = await fetch('/api/categories', { headers: getHeaders() });
+      if (res.ok) allCategories = await res.json();
+    } catch(err) {}
+  }
+
+  async function fetchMedia(reset = false) {
+    if (isFetching || (!hasMore && !reset)) return;
+    
+    if (reset) {
+      currentOffset = 0;
+      hasMore = true;
+      allMedia = [];
+      gallery.innerHTML = '';
+      emptyState.classList.add('hidden');
+      await fetchCategories();
+      renderTabs(); // Refresh dynamic category tabs
+    }
+    
+    isFetching = true;
+    document.getElementById('loading').classList.remove('hidden');
+
+    try {
+      let url = `/api/media?limit=${LIMIT}&offset=${currentOffset}`;
+      if (currentFilter !== 'all') {
+        if (currentFilter.startsWith('caption:')) {
+          url += `&caption=${encodeURIComponent(currentFilter.replace('caption:', ''))}`;
+        } else {
+          url += `&type=${currentFilter}`;
+        }
+      }
+      if (searchQuery) {
+        url += `&search=${encodeURIComponent(searchQuery)}`;
+      }
+
+      const res = await fetch(url, { headers: getHeaders() });
+      if (!res.ok) throw new Error("Failed");
       const data = await res.json();
-      allMedia = data;
-      renderTabs();
-      renderGallery();
+      
+      if (data.length < LIMIT) hasMore = false;
+      
+      if (data.length === 0 && currentOffset === 0) {
+        emptyState.classList.remove('hidden');
+      } else {
+        emptyState.classList.add('hidden');
+        data.forEach((item, index) => {
+          if (!allMedia.find(m => m.id === item.id)) {
+            allMedia.push(item);
+            gallery.appendChild(createCard(item, index));
+          }
+        });
+        currentOffset += data.length;
+      }
     } catch (err) {
-      console.error("Failed to fetch media", err);
+      console.error(err);
+    } finally {
+      isFetching = false;
+      document.getElementById('loading').classList.add('hidden');
     }
   }
 
   function setupSocketListeners() {
-    socket.on('new_media', (mediaItem) => {
-      if (mediaItem.mediaGroupId && mediaItem.caption) {
-        allMedia.forEach(m => {
-          if (m.mediaGroupId === mediaItem.mediaGroupId) {
-            m.caption = mediaItem.caption;
-          }
-        });
-      }
-
-      if (!allMedia.find(m => m.messageId === mediaItem.messageId)) {
-        allMedia.unshift(mediaItem);
-      }
-      renderTabs();
-      renderGallery();
-    });
-
-    socket.on('media_deleted', (id) => {
-      allMedia = allMedia.filter(m => m.id !== id);
-      renderTabs();
-      renderGallery();
-    });
-
+    socket.on('new_media', () => { fetchMedia(true); });
+    socket.on('media_deleted', () => { fetchMedia(true); });
     socket.on('category_deleted', (caption) => {
-      allMedia = allMedia.filter(m => m.caption !== caption);
-      renderTabs();
-      renderGallery();
+      if (currentFilter === `caption:${caption}`) currentFilter = 'all';
+      fetchMedia(true);
     });
   }
 
@@ -251,13 +301,8 @@ document.addEventListener('DOMContentLoaded', () => {
       { id: 'document', label: 'Documents' }
     ];
 
-    const uniqueCaptions = [...new Set(allMedia
-      .filter(m => m.type !== 'document' && m.caption && m.caption.trim() !== '')
-      .map(m => m.caption)
-    )];
-
     const allTabs = [...defaultTabs];
-    uniqueCaptions.forEach(cap => {
+    allCategories.forEach(cap => {
       if (cap.length < 35 && !cap.includes('.')) {
         allTabs.push({ id: `caption:${cap}`, label: `📁 ${cap}` });
       } else if (cap.length >= 35) {
@@ -275,8 +320,31 @@ document.addEventListener('DOMContentLoaded', () => {
       btn.innerText = t.label;
       btn.addEventListener('click', () => {
         currentFilter = t.id;
+        
+        const headerDiv = document.getElementById('gallery-header');
+        if (headerDiv) {
+          headerDiv.innerHTML = '';
+          if (currentFilter.startsWith('caption:')) {
+            const targetCaption = currentFilter.replace('caption:', '');
+            const delBtn = document.createElement('button');
+            delBtn.className = 'btn delete-btn';
+            delBtn.innerText = '🗑️ Delete Entire Folder';
+            delBtn.onclick = async () => {
+              if (confirm(`Are you sure you want to delete all media in "${targetCaption}"?`)) {
+                await fetch(`/api/category/${encodeURIComponent(targetCaption)}`, { 
+                  method: 'DELETE', 
+                  headers: getHeaders() 
+                });
+                currentFilter = 'all';
+                fetchMedia(true);
+              }
+            };
+            headerDiv.appendChild(delBtn);
+          }
+        }
+        
         renderTabs(); 
-        renderGallery();
+        fetchMedia(true);
       });
       tabsContainer.appendChild(btn);
     });
