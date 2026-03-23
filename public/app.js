@@ -1,11 +1,29 @@
 document.addEventListener('DOMContentLoaded', () => {
-  const socket = io();
+  let socket = null;
   const gallery = document.getElementById('gallery');
-  const tabs = document.querySelectorAll('.tab');
   const emptyState = document.getElementById('empty-state');
   const themeToggle = document.getElementById('themeToggle');
   const searchInput = document.getElementById('searchInput');
   const html = document.documentElement;
+
+  // View Elements
+  const authView = document.getElementById('auth-view');
+  const appView = document.getElementById('app-view');
+  const authForm = document.getElementById('auth-form');
+  const authUsername = document.getElementById('auth-username');
+  const authPassword = document.getElementById('auth-password');
+  const authSwitchBtn = document.getElementById('auth-switch-btn');
+  const authTitle = document.getElementById('auth-title');
+  const authBtn = document.getElementById('auth-submit-btn');
+  const logoutBtn = document.getElementById('logoutBtn');
+
+  // Profile Elements
+  const profileToggle = document.getElementById('profileToggle');
+  const profileModal = document.getElementById('profile-modal');
+  const profileClose = document.getElementById('profile-close');
+  const profileForm = document.getElementById('profile-form');
+  const profileBotToken = document.getElementById('profile-bot-token');
+  const profileChatId = document.getElementById('profile-chat-id');
 
   // Lightbox elements
   const lightbox = document.getElementById('lightbox');
@@ -16,17 +34,30 @@ document.addEventListener('DOMContentLoaded', () => {
   
   let currentFilter = 'all';
   let allMedia = [];
-
-  // Search Input Listener
-  if (searchInput) {
-    searchInput.addEventListener('input', () => {
-      renderGallery();
-    });
-  }
+  let isLogin = true;
 
   // Initialize Theme
   const savedTheme = localStorage.getItem('theme') || 'dark';
   html.setAttribute('data-theme', savedTheme);
+
+  // Toast System
+  function showToast(message, type = 'info') {
+    const toast = document.createElement('div');
+    toast.className = `toast toast-${type}`;
+    toast.innerHTML = `
+      <div class="toast-icon">${type === 'success' ? '✓' : type === 'error' ? '✕' : 'i'}</div>
+      <div class="toast-message">${message}</div>
+    `;
+    document.body.appendChild(toast);
+    
+    // trigger animation
+    setTimeout(() => toast.classList.add('show'), 10);
+    
+    setTimeout(() => {
+      toast.classList.remove('show');
+      setTimeout(() => toast.remove(), 400);
+    }, 4000);
+  }
 
   themeToggle.addEventListener('click', () => {
     const currentTheme = html.getAttribute('data-theme');
@@ -35,12 +66,144 @@ document.addEventListener('DOMContentLoaded', () => {
     localStorage.setItem('theme', newTheme);
   });
 
-  // Fetch initial media
-  fetchMedia();
+  // Check Auth on load
+  checkAuth();
+
+  function getHeaders() {
+    return {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${localStorage.getItem('token')}`
+    };
+  }
+
+  async function checkAuth() {
+    const token = localStorage.getItem('token');
+    if (!token) {
+      showAuth();
+      return;
+    }
+
+    try {
+      const res = await fetch('/api/user/profile', { headers: getHeaders() });
+      if (res.ok) {
+        const data = await res.json();
+        profileBotToken.value = data.telegram_bot_token || '';
+        profileChatId.value = data.telegram_chat_id || '';
+        showApp();
+      } else {
+        localStorage.removeItem('token');
+        showAuth();
+      }
+    } catch(err) {
+      showAuth();
+    }
+  }
+
+  function showAuth() {
+    authView.classList.remove('section-hidden');
+    appView.classList.add('section-hidden');
+  }
+
+  function showApp() {
+    authView.classList.add('section-hidden');
+    appView.classList.remove('section-hidden');
+    
+    // Connect socket
+    if (socket) socket.disconnect();
+    socket = io({ auth: { token: localStorage.getItem('token') } });
+    setupSocketListeners();
+    
+    fetchMedia();
+  }
+
+  authSwitchBtn.addEventListener('click', () => {
+    isLogin = !isLogin;
+    authTitle.innerText = isLogin ? 'Login' : 'Register';
+    authBtn.innerText = isLogin ? 'Login' : 'Register';
+    document.getElementById('auth-switch-text').innerText = isLogin ? "Don't have an account?" : "Already have an account?";
+  });
+
+  authForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const endpoint = isLogin ? '/api/auth/login' : '/api/auth/register';
+    const originalText = authBtn.innerText;
+    authBtn.innerText = 'Loading...';
+    authBtn.disabled = true;
+
+    try {
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: authUsername.value, password: authPassword.value })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        localStorage.setItem('token', data.token);
+        showToast(`Welcome ${isLogin ? 'back' : ''}, ${data.user.username}!`, 'success');
+        checkAuth();
+      } else {
+        showToast(data.error || 'Authentication failed', 'error');
+      }
+    } catch(err) {
+      showToast('Network error while authenticating', 'error');
+    } finally {
+      authBtn.innerText = originalText;
+      authBtn.disabled = false;
+    }
+  });
+
+  logoutBtn.addEventListener('click', () => {
+    localStorage.removeItem('token');
+    if (socket) socket.disconnect();
+    showToast('Logged out successfully', 'success');
+    showAuth();
+  });
+
+  // Profile Modal
+  profileToggle.addEventListener('click', () => profileModal.classList.remove('hidden'));
+  profileClose.addEventListener('click', () => profileModal.classList.add('hidden'));
+
+  profileForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const profileSaveBtn = document.getElementById('profile-save-btn');
+    const originalText = profileSaveBtn.innerText;
+    profileSaveBtn.innerText = 'Verifying Token...';
+    profileSaveBtn.disabled = true;
+
+    try {
+      const res = await fetch('/api/user/profile', {
+        method: 'POST',
+        headers: getHeaders(),
+        body: JSON.stringify({
+          telegram_bot_token: profileBotToken.value,
+          telegram_chat_id: profileChatId.value
+        })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        showToast('Bot Configuration Saved! Successfully connected.', 'success');
+        profileModal.classList.add('hidden');
+      } else {
+        showToast(data.error || 'Failed to save profile', 'error');
+      }
+    } catch(err) {
+      showToast('Network error while saving profile', 'error');
+    } finally {
+      profileSaveBtn.innerText = originalText;
+      profileSaveBtn.disabled = false;
+    }
+  });
+
+  if (searchInput) {
+    searchInput.addEventListener('input', () => {
+      renderGallery();
+    });
+  }
 
   async function fetchMedia() {
     try {
-      const res = await fetch('/api/media?limit=100');
+      const res = await fetch('/api/media?limit=100', { headers: getHeaders() });
+      if (!res.ok) throw new Error("Failed to fetch");
       const data = await res.json();
       allMedia = data;
       renderTabs();
@@ -50,41 +213,36 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
-  // Socket listener for real-time updates
-  socket.on('new_media', (mediaItem) => {
-    // Determine if we need to update captions internally
-    if (mediaItem.mediaGroupId && mediaItem.caption) {
-      // It's a captioned album part. Update existing local media with the same mediaGroupId!
-      allMedia.forEach(m => {
-        if (m.mediaGroupId === mediaItem.mediaGroupId) {
-          m.caption = mediaItem.caption;
-        }
-      });
-    }
+  function setupSocketListeners() {
+    socket.on('new_media', (mediaItem) => {
+      if (mediaItem.mediaGroupId && mediaItem.caption) {
+        allMedia.forEach(m => {
+          if (m.mediaGroupId === mediaItem.mediaGroupId) {
+            m.caption = mediaItem.caption;
+          }
+        });
+      }
 
-    // Check if it already exists (prevent duplicates on edge cases)
-    if (!allMedia.find(m => m.messageId === mediaItem.messageId)) {
-      allMedia.unshift(mediaItem);
-    }
+      if (!allMedia.find(m => m.messageId === mediaItem.messageId)) {
+        allMedia.unshift(mediaItem);
+      }
+      renderTabs();
+      renderGallery();
+    });
 
-    renderTabs();
-    renderGallery();
-  });
+    socket.on('media_deleted', (id) => {
+      allMedia = allMedia.filter(m => m.id !== id);
+      renderTabs();
+      renderGallery();
+    });
 
-  // Socket listeners for deletes
-  socket.on('media_deleted', (id) => {
-    allMedia = allMedia.filter(m => m.id !== id);
-    renderTabs();
-    renderGallery();
-  });
+    socket.on('category_deleted', (caption) => {
+      allMedia = allMedia.filter(m => m.caption !== caption);
+      renderTabs();
+      renderGallery();
+    });
+  }
 
-  socket.on('category_deleted', (caption) => {
-    allMedia = allMedia.filter(m => m.caption !== caption);
-    renderTabs();
-    renderGallery();
-  });
-
-  // Dynamic Tabs Creation
   function renderTabs() {
     const defaultTabs = [
       { id: 'all', label: 'All Media' },
@@ -93,7 +251,6 @@ document.addEventListener('DOMContentLoaded', () => {
       { id: 'document', label: 'Documents' }
     ];
 
-    // Extract unique captions
     const uniqueCaptions = [...new Set(allMedia
       .filter(m => m.type !== 'document' && m.caption && m.caption.trim() !== '')
       .map(m => m.caption)
@@ -101,11 +258,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const allTabs = [...defaultTabs];
     uniqueCaptions.forEach(cap => {
-      // Skip very long captions or system filenames
       if (cap.length < 35 && !cap.includes('.')) {
         allTabs.push({ id: `caption:${cap}`, label: `📁 ${cap}` });
       } else if (cap.length >= 35) {
-        // Fallback for long captions
         allTabs.push({ id: `caption:${cap}`, label: `📁 ${cap.substring(0, 20)}...` });
       }
     });
@@ -120,7 +275,7 @@ document.addEventListener('DOMContentLoaded', () => {
       btn.innerText = t.label;
       btn.addEventListener('click', () => {
         currentFilter = t.id;
-        renderTabs(); // update active state
+        renderTabs(); 
         renderGallery();
       });
       tabsContainer.appendChild(btn);
@@ -132,10 +287,8 @@ document.addEventListener('DOMContentLoaded', () => {
     const headerDiv = document.getElementById('gallery-header');
     if (headerDiv) headerDiv.innerHTML = '';
     
-    const searchInput = document.getElementById('searchInput');
     const query = searchInput ? searchInput.value.toLowerCase().trim() : '';
     
-    // Add "Delete Category" button if we are looking at a specific folder
     if (currentFilter.startsWith('caption:')) {
       const targetCaption = currentFilter.replace('caption:', '');
       const delBtn = document.createElement('button');
@@ -143,30 +296,23 @@ document.addEventListener('DOMContentLoaded', () => {
       delBtn.innerText = '🗑️ Delete Entire Folder';
       delBtn.onclick = async () => {
         if(confirm(`Are you sure you want to delete all media in "${targetCaption}"?`)){
-          await fetch(`/api/category/${encodeURIComponent(targetCaption)}`, { method: 'DELETE' });
-          currentFilter = 'all'; // Reset filter
+          await fetch(`/api/category/${encodeURIComponent(targetCaption)}`, { 
+            method: 'DELETE',
+            headers: getHeaders()
+          });
+          currentFilter = 'all'; 
         }
       };
       if (headerDiv) headerDiv.appendChild(delBtn);
     }
     
     const filtered = allMedia.filter(item => {
-      // 1. Text Search Filter
-      if (query) {
-        if (!item.caption || !item.caption.toLowerCase().includes(query)) {
-          return false;
-        }
-      }
-
-      // 2. Tab Category Filter
+      if (query && (!item.caption || !item.caption.toLowerCase().includes(query))) return false;
       if (currentFilter === 'all') return true;
       if (currentFilter === 'photo' && item.type === 'photo') return true;
       if (currentFilter === 'video' && item.type === 'video') return true;
       if (currentFilter === 'document' && item.type === 'document') return true;
-      if (currentFilter.startsWith('caption:')) {
-        const targetCaption = currentFilter.replace('caption:', '');
-        return item.caption === targetCaption;
-      }
+      if (currentFilter.startsWith('caption:')) return item.caption === currentFilter.replace('caption:', '');
       return false;
     });
 
@@ -195,9 +341,10 @@ document.addEventListener('DOMContentLoaded', () => {
     div.className = 'media-card glass';
     div.style.animationDelay = `${index * 0.05}s`;
 
-    let mediaHTML = '';
-    const proxyUrl = `/api/proxy/${item.fileId}`;
+    const token = localStorage.getItem('token');
+    const proxyUrl = `/api/proxy/${item.fileId}?token=${token}`;
     
+    let mediaHTML = '';
     if (item.type === 'photo') {
       mediaHTML = `<div class="media-content-container"><img src="${proxyUrl}" class="media-thumbnail" alt="${item.caption || 'Photo'}" loading="lazy" /></div>`;
     } else if (item.type === 'video') {
@@ -231,19 +378,19 @@ document.addEventListener('DOMContentLoaded', () => {
       </div>
     `;
 
-    // Handle delete action
     const deleteBtn = div.querySelector('.card-delete-btn');
     deleteBtn.addEventListener('click', async (e) => {
-      e.stopPropagation(); // prevent opening lightbox
+      e.stopPropagation(); 
       if (confirm('Are you sure you want to delete this media?')) {
-        await fetch('/api/media/' + item.id, { method: 'DELETE' });
+        await fetch('/api/media/' + item.id, { 
+          method: 'DELETE',
+          headers: getHeaders()
+        });
       }
     });
 
-    // Click handler for Lightbox or Download
     div.addEventListener('click', () => {
       if (item.type === 'document') {
-        // Automatically download via proxy endpoint
         const a = document.createElement('a');
         a.href = proxyUrl;
         a.download = item.caption || 'document';
@@ -283,21 +430,14 @@ document.addEventListener('DOMContentLoaded', () => {
   function closeLightbox() {
     lightbox.classList.add('hidden');
     document.body.style.overflow = '';
-    lightboxMediaCont.innerHTML = ''; // Stop video playback
+    lightboxMediaCont.innerHTML = ''; 
   }
 
   lightboxClose.addEventListener('click', closeLightbox);
   lightbox.addEventListener('click', (e) => {
-    // Close if clicked outside the content
-    if (e.target.classList.contains('lightbox-overlay')) {
-      closeLightbox();
-    }
+    if (e.target.classList.contains('lightbox-overlay')) closeLightbox();
   });
-
-  // Handle ESC key
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && !lightbox.classList.contains('hidden')) {
-      closeLightbox();
-    }
+    if (e.key === 'Escape' && !lightbox.classList.contains('hidden')) closeLightbox();
   });
 });
